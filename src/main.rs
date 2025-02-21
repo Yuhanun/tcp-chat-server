@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let server = Server::bind("0.0.0.0:8888").await?;
+    let mut server = Server::bind("0.0.0.0:8888").await?;
     let mut encoder = Encoder::default();
     let mut decoder = Decoder::default();
 
@@ -35,9 +35,14 @@ async fn main() -> anyhow::Result<()> {
     let cancellation_token = CancellationToken::new();
     let ctrlc_cancellation_token = cancellation_token.clone();
 
-    let encoder_fut = encoder.run(encoder_receiver, decoder_event_receiver);
+    let encoder_fut = encoder.run(encoder_receiver);
     let decoder_fut = decoder.run(decoder_receiver, decoder_event_sender);
-    let server_fut = server.run(encoder_sender, decoder_sender, cancellation_token.clone());
+    let server_fut = server.run(
+        encoder_sender,
+        decoder_sender,
+        decoder_event_receiver,
+        cancellation_token.clone(),
+    );
 
     ctrlc::set_handler(move || {
         tracing::warn!("Ctrl-C received, cancelling tasks");

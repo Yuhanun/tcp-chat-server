@@ -1,11 +1,12 @@
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::str::FromStr;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::models::{ClientId, Message};
+use crate::models::{ClientId, Message, Order};
 
 #[derive(Debug)]
 pub enum DecoderTaskControl {
@@ -15,7 +16,7 @@ pub enum DecoderTaskControl {
 #[derive(Debug)]
 pub enum DecoderEvent {
     ClientDisconnected(ClientId),
-    ClientMessage(Message),
+    Order(ClientId, Order),
 }
 
 #[derive(Debug, Default)]
@@ -25,7 +26,13 @@ pub struct Decoder {
 
 struct DecoderMessage {
     disconnected_clients: Vec<ClientId>,
-    message: Option<(ClientId, String)>,
+    message: Option<(ClientId, Order)>,
+}
+
+pub enum ClientDecodeResult {
+    Ok(Order),
+    SocketError(std::io::Error),
+    ClientDisconnected,
 }
 
 impl Decoder {
@@ -37,11 +44,24 @@ impl Decoder {
     async fn next_message_client(
         client_id: &ClientId,
         lines: &mut Lines<BufReader<OwnedReadHalf>>,
-    ) -> (ClientId, anyhow::Result<Option<String>>) {
-        (
-            *client_id,
-            lines.next_line().await.map_err(|e| anyhow::anyhow!(e)),
-        )
+    ) -> (ClientId, ClientDecodeResult) {
+        loop {
+            let next_line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => return (*client_id, ClientDecodeResult::ClientDisconnected),
+                Err(e) => return (*client_id, ClientDecodeResult::SocketError(e)),
+            };
+
+            let order = match Order::from_str(&next_line) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!("Invalid request from {:?}: {:?}", client_id, e);
+                    continue;
+                }
+            };
+
+            return (*client_id, ClientDecodeResult::Ok(order));
+        }
     }
 
     async fn decode_message(&mut self) -> anyhow::Result<DecoderMessage> {
@@ -61,22 +81,22 @@ impl Decoder {
 
         loop {
             let Some((client_id, result)) = futures.next().await else {
+                tracing::info!("We have ran out of futures");
                 break;
             };
 
             match result {
-                Ok(Some(message)) => {
+                ClientDecodeResult::Ok(order) => {
                     return Ok(DecoderMessage {
                         disconnected_clients,
-                        message: Some((client_id, message)),
+                        message: Some((client_id, order)),
                     });
                 }
-                Ok(None) => {
-                    tracing::info!("{:?} disconnected", client_id);
+                ClientDecodeResult::SocketError(_error) => {
+                    // There are cases where we could move on. For now disconnect
                     disconnected_clients.push(client_id);
                 }
-                Err(e) => {
-                    tracing::error!("Error reading from {:?}: {:?}", client_id, e);
+                ClientDecodeResult::ClientDisconnected => {
                     disconnected_clients.push(client_id);
                 }
             }
@@ -123,12 +143,9 @@ impl Decoder {
                         self.clients.remove(&client_id);
                     }
 
-                    if let Some((client_id, message)) = message {
-                        tracing::info!("Message from client {client_id:?}: {message}");
-                        sender.send(DecoderEvent::ClientMessage(Message {
-                            origin_client_id: client_id,
-                            message,
-                        })).await?;
+                    if let Some((client_id, order)) = message {
+                        tracing::info!("Message from client {client_id:?}: {order:?}");
+                        sender.send(DecoderEvent::Order(client_id, order)).await?;
                     }
                 }
             }

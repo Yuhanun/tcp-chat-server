@@ -14,5 +14,6 @@
 )]
 pub mod decoder;
 pub mod encoder;
+pub mod matcher;
 pub mod models;
 pub mod server;

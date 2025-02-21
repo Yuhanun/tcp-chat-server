@@ -4,13 +4,16 @@ use anyhow::Context;
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::mpsc::Receiver};
 
 use crate::{
-    decoder::DecoderEvent,
-    models::{ClientId, Encode, Login, MessageAck},
+    matcher::Match,
+    models::{ClientId, Encode, Login, OrderAck, Trade},
 };
 
 #[derive(Debug)]
 pub enum EncoderTaskControl {
     ClientAdded(ClientId, OwnedWriteHalf),
+    ClientDisconnected(ClientId),
+    OrderAck(ClientId, OrderAck),
+    Match(Match),
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +90,23 @@ impl Encoder {
                         }
                     }
                 }
+                EncoderTaskControl::ClientDisconnected(client_id) => {
+                    self.clients.remove(&client_id);
+                }
+                EncoderTaskControl::OrderAck(client_id, order_ack) => {
+                    let client = self
+                        .clients
+                        .get_mut(&client_id)
+                        .context("Client not found")?;
+
+                    Self::send(&order_ack, client).await?;
+                }
+                EncoderTaskControl::Match(m) => {
+                    for (_, write) in &mut self.clients {
+                        let trade = Trade { product: m.product };
+                        Self::send(&trade, write).await?;
+                    }
+                }
             }
         } else {
             tracing::info!("Encoder: Channel closed");
@@ -96,49 +116,7 @@ impl Encoder {
         Ok(())
     }
 
-    async fn handle_decoder_message(
-        &mut self,
-        message: Option<DecoderEvent>,
-    ) -> anyhow::Result<()> {
-        match message {
-            Some(DecoderEvent::ClientDisconnected(client_id)) => {
-                self.clients.remove(&client_id);
-            }
-            Some(DecoderEvent::ClientMessage(message)) => {
-                for (other_client_id, write) in &mut self.clients {
-                    if *other_client_id == message.origin_client_id {
-                        continue;
-                    }
-                    tracing::info!(
-                        "Sending message to client {:?}: {}",
-                        other_client_id,
-                        message.message
-                    );
-
-                    // Note: We encode for every client here, might be worth improving in the future
-                    Self::send(&message, write).await?;
-                }
-
-                let write = self
-                    .clients
-                    .get_mut(&message.origin_client_id)
-                    .context("Client not found")?;
-                Self::send(&MessageAck, write).await?;
-            }
-            None => {
-                tracing::info!("Encoder: Channel closed");
-                anyhow::bail!("Channel closed");
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn run(
-        &mut self,
-        mut receiver: Receiver<EncoderTaskControl>,
-        mut decoder_event_receiver: Receiver<DecoderEvent>,
-    ) -> anyhow::Result<()> {
+    pub async fn run(&mut self, mut receiver: Receiver<EncoderTaskControl>) -> anyhow::Result<()> {
         tracing::info!("Encoder started");
         loop {
             tracing::info!("Encoder - Waiting for message...");
@@ -147,9 +125,9 @@ impl Encoder {
                 message = receiver.recv() =>  {
                     self.handle_control_message(message).await?;
                 }
-                message = decoder_event_receiver.recv() => {
-                    self.handle_decoder_message(message).await?;
-                }
+                // message = server_event_receiver.recv() => {
+                //     self.handle_server_message(message).await?;
+                // }
             }
         }
     }

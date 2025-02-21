@@ -1,14 +1,25 @@
 use std::{fmt::Debug, net::SocketAddr};
 
 use anyhow::Context;
-use tokio::{net::ToSocketAddrs, sync::mpsc::Sender};
+use tokio::{
+    net::ToSocketAddrs,
+    sync::mpsc::{Receiver, Sender},
+};
 use tokio_util::sync::CancellationToken;
 
-use crate::{decoder::DecoderTaskControl, encoder::EncoderTaskControl, models::ClientId};
+use crate::{
+    decoder::{DecoderEvent, DecoderTaskControl},
+    encoder::EncoderTaskControl,
+    matcher::Matcher,
+    models::{ClientId, Message, OrderAck, Side, Trade},
+};
 
 #[derive(Debug)]
 pub struct Server {
     listener: tokio::net::TcpListener,
+
+    // Cell
+    matcher: Matcher,
 }
 
 impl Server {
@@ -16,6 +27,7 @@ impl Server {
         tracing::info!("Starting server on {addr:?}");
         Ok(Self {
             listener: tokio::net::TcpListener::bind(addr).await?,
+            matcher: Matcher::new(),
         })
     }
 
@@ -49,16 +61,66 @@ impl Server {
         Ok(())
     }
 
+    // Mutable TODO
+    async fn handle_decoder_event(
+        &mut self,
+        msg: DecoderEvent,
+        encoder_sender: &Sender<EncoderTaskControl>,
+    ) -> anyhow::Result<()> {
+        match msg {
+            DecoderEvent::ClientDisconnected(client_id) => {
+                // forward the event
+                encoder_sender
+                    .send(EncoderTaskControl::ClientDisconnected(client_id))
+                    .await?;
+
+                Ok(())
+            }
+            DecoderEvent::Order(client_id, order) => {
+                encoder_sender
+                    .send(EncoderTaskControl::OrderAck(
+                        client_id,
+                        OrderAck {
+                            product: order.product,
+                        },
+                    ))
+                    .await?;
+
+                let trade_opt = match order.side {
+                    Side::Buy => self.matcher.add_buy(order.product),
+                    Side::Sell => self.matcher.add_sell(order.product),
+                };
+
+                if let Some(t) = trade_opt {
+                    encoder_sender.send(EncoderTaskControl::Match(t)).await?;
+                }
+
+                Ok(())
+            }
+        }
+    }
+
     pub async fn run(
-        &self,
+        &mut self,
         encoder_sender: Sender<EncoderTaskControl>,
         decoder_sender: Sender<DecoderTaskControl>,
+        mut decoder_event_receiver: Receiver<DecoderEvent>,
         cancellation_token: CancellationToken,
     ) -> anyhow::Result<()> {
         tracing::info!("Server started");
         loop {
             tracing::info!("Waiting for connection...");
             tokio::select! {
+                biased;
+                decoder_event = decoder_event_receiver.recv() => {
+                    match decoder_event {
+                        None => {},
+                        Some(msg) => {
+                            self.handle_decoder_event(msg, &encoder_sender).await?;
+                        }
+                    }
+
+                }
                 () = cancellation_token.cancelled() => {
                     tracing::info!("Server cancelled");
                     return Ok(());
